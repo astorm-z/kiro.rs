@@ -48,7 +48,7 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
+/// 查找真正的 thinking 结束标签（不被引用字符包裹）
 ///
 /// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
 /// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。
@@ -56,8 +56,8 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
 ///
 /// 跳过的情况：
 /// - 被引用字符包裹（反引号、引号等）
-/// - 后面没有双换行符（真正的结束标签后面会有 `\n\n`）
-/// - 标签在缓冲区末尾（流式处理时需要等待更多内容）
+/// - 标签后面紧跟非空白字符（说明不是真正的结束标签）
+/// - 标签在缓冲区末尾且后面内容不足以判断（流式处理时需要等待更多内容）
 ///
 /// # 参数
 /// - `buffer`: 要搜索的字符串
@@ -88,17 +88,19 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
         // 检查后面的内容
         let after_content = &buffer[after_pos..];
 
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
-        if after_content.len() < 2 {
+        // 如果标签后面内容不足以判断，等待更多内容
+        if after_content.is_empty() {
             return None;
         }
 
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
-        if after_content.starts_with("\n\n") {
+        // 真正的 thinking 结束标签后面应该是换行符或空白字符
+        // 接受 `\n\n`、`\n` 或其他空白字符开头
+        let first_char = after_content.chars().next().unwrap();
+        if first_char.is_whitespace() {
             return Some(absolute_pos);
         }
 
-        // 不是双换行符，跳过继续搜索
+        // 后面不是空白字符，跳过继续搜索
         search_start = absolute_pos + 1;
     }
 
@@ -140,6 +142,22 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     }
 
     None
+}
+
+/// 计算安全的缓冲区分割位置
+///
+/// 在流式处理中，需要保留缓冲区末尾的部分内容以防止标签被切断。
+/// 这个函数计算可以安全发送的内容长度，确保不会在 UTF-8 字符中间切割。
+///
+/// # 参数
+/// - `buffer`: 缓冲区内容
+/// - `reserve_len`: 需要保留的字节数（用于可能的标签匹配）
+///
+/// # 返回值
+/// - 可以安全发送的内容长度（字符边界对齐）
+fn calculate_safe_buffer_split(buffer: &str, reserve_len: usize) -> usize {
+    let target_len = buffer.len().saturating_sub(reserve_len);
+    find_char_boundary(buffer, target_len)
 }
 
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
@@ -682,11 +700,7 @@ impl StreamContext {
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub("<thinking>".len());
-                    let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
+                    let safe_len = calculate_safe_buffer_split(&self.thinking_buffer, "<thinking>".len());
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         // 如果 thinking 尚未提取，且安全内容只是空白字符，
@@ -742,33 +756,61 @@ impl StreamContext {
                         }
                     }
 
-                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
-                    self.thinking_buffer =
-                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
+                    // 剥离结束标签和后续空白字符
+                    // find_real_thinking_end_tag 现在接受 \n 或其他空白字符
+                    let after_tag_pos = end_pos + "</thinking>".len();
+                    // 跳过标签后的空白字符
+                    let remaining_start = self.thinking_buffer[after_tag_pos..]
+                        .find(|c: char| !c.is_whitespace())
+                        .map(|pos| after_tag_pos + pos)
+                        .unwrap_or(self.thinking_buffer.len());
+                    self.thinking_buffer = self.thinking_buffer[remaining_start..].to_string();
                 } else {
-                    // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
-                    // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
-                    // find_real_thinking_end_tag 要求标签后有 `\n\n` 才返回 Some，
-                    // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
-                    // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
-                    // 标签的前几个字符会被错误地作为 thinking_delta 发出。
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub("</thinking>\n\n".len());
-                    let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
-                    if safe_len > 0 {
-                        let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
+                    // 没有找到标准结束标签，尝试边界检测
+                    if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
+                        // 找到边界结束标签
+                        let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                        if !thinking_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
+                                    self.create_thinking_delta_event(thinking_index, &thinking_content),
                                 );
                             }
                         }
-                        self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+
+                        // 结束 thinking 块
+                        self.in_thinking_block = false;
+                        self.thinking_extracted = true;
+
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
+                        }
+
+                        let after_tag_pos = end_pos + "</thinking>".len();
+                        let remaining = self.thinking_buffer[after_tag_pos..].trim_start().to_string();
+                        self.thinking_buffer = remaining;
+                    } else {
+                        // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta
+                        // 保留末尾可能是部分 `</thinking>` 的内容
+                        let safe_len = calculate_safe_buffer_split(&self.thinking_buffer, "</thinking>".len());
+                        if safe_len > 0 {
+                            let safe_content = self.thinking_buffer[..safe_len].to_string();
+                            if !safe_content.is_empty() {
+                                if let Some(thinking_index) = self.thinking_block_index {
+                                    events.push(
+                                        self.create_thinking_delta_event(thinking_index, &safe_content),
+                                    );
+                                }
+                            }
+                            self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        }
+                        break;
                     }
-                    break;
                 }
             } else {
                 // thinking 已提取完成，剩余内容作为 text_delta
@@ -1410,10 +1452,16 @@ mod tests {
 
     #[test]
     fn test_find_real_thinking_end_tag_basic() {
-        // 基本情况：正常的结束标签后面有双换行符
+        // 基本情况：正常的结束标签后面有换行符或空白字符
         assert_eq!(find_real_thinking_end_tag("</thinking>\n\n"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking> "), Some(0));
         assert_eq!(
             find_real_thinking_end_tag("content</thinking>\n\n"),
+            Some(7)
+        );
+        assert_eq!(
+            find_real_thinking_end_tag("content</thinking>\n"),
             Some(7)
         );
         assert_eq!(
@@ -1421,10 +1469,12 @@ mod tests {
             Some(9)
         );
 
-        // 没有双换行符的情况
+        // 没有空白字符的情况（缓冲区为空，需要等待更多内容）
         assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
+
+        // 后面紧跟非空白字符（不是真正的结束标签）
+        assert_eq!(find_real_thinking_end_tag("</thinking>more"), None);
+        assert_eq!(find_real_thinking_end_tag("</thinking>text"), None);
     }
 
     #[test]
