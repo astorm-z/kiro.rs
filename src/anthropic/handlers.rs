@@ -291,7 +291,7 @@ pub async fn post_messages(
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled).await
     }
 }
 
@@ -431,12 +431,48 @@ fn create_sse_stream(
 /// 上下文窗口大小（200k tokens）
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
+/// 从文本中提取 thinking 内容
+///
+/// 查找 `<thinking>...</thinking>` 标签，提取其中的内容并从原文本中移除。
+/// 返回 (thinking_content, remaining_text)
+fn extract_thinking_content(text: &str) -> (Option<String>, String) {
+    // 查找 <thinking> 开始标签
+    let start_tag = "<thinking>";
+    let end_tag = "</thinking>";
+
+    if let Some(start_pos) = text.find(start_tag) {
+        let content_start = start_pos + start_tag.len();
+
+        // 查找对应的结束标签
+        if let Some(end_pos) = text[content_start..].find(end_tag) {
+            let thinking_end = content_start + end_pos;
+
+            // 提取 thinking 内容（去除前后空白）
+            let thinking_content = text[content_start..thinking_end].trim().to_string();
+
+            // 构建剩余文本：标签之前的内容 + 标签之后的内容
+            let before = &text[..start_pos];
+            let after_pos = thinking_end + end_tag.len();
+            let after = &text[after_pos..];
+
+            // 合并前后内容，去除多余的空白
+            let remaining = format!("{}{}", before, after).trim().to_string();
+
+            return (Some(thinking_content), remaining);
+        }
+    }
+
+    // 没有找到 thinking 标签，返回原文本
+    (None, text.to_string())
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    thinking_enabled: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -555,13 +591,28 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
+    // 处理 thinking 标签（如果启用）
+    let (thinking_content, final_text_content) = if thinking_enabled {
+        extract_thinking_content(&text_content)
+    } else {
+        (None, text_content)
+    };
+
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if !text_content.is_empty() {
+    // 如果有 thinking 内容，先添加 thinking 块
+    if let Some(thinking) = thinking_content {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": thinking
+        }));
+    }
+
+    if !final_text_content.is_empty() {
         content.push(json!({
             "type": "text",
-            "text": text_content
+            "text": final_text_content
         }));
     }
 
